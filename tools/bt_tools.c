@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #if defined(__NuttX__)
 #include <system/readline.h>
 #endif
@@ -87,6 +88,37 @@ static void* adapter_callback = NULL;
 static bool g_cmd_had_inited = false;
 bool g_auto_accept_pair = true;
 bond_state_t g_bond_state = BOND_STATE_NONE;
+static _Atomic(uv_loop_t*) g_bttool_loop_atomic = NULL;
+
+/* Atomic pointer helper functions */
+static inline uv_loop_t* get_bttool_loop(void)
+{
+    return atomic_load(&g_bttool_loop_atomic);
+}
+
+static inline void set_bttool_loop(uv_loop_t* loop)
+{
+    atomic_store(&g_bttool_loop_atomic, loop);
+}
+
+static inline bool is_loop_valid_and_not_closed(void)
+{
+    /* Get a snapshot of the current pointer */
+    uv_loop_t* loop = atomic_load_explicit(&g_bttool_loop_atomic, memory_order_acquire);
+
+    if (!loop) {
+        return false;
+    }
+
+    /* Verify the pointer is still valid (prevent TOCTOU) */
+    uv_loop_t* current = atomic_load_explicit(&g_bttool_loop_atomic, memory_order_acquire);
+    if (loop != current) {
+        return false;  /* Pointer changed during check */
+    }
+
+    /* Check loop state */
+    return (loop->data != NULL) && !uv_loop_is_close(loop);
+}
 
 static struct {
     int cmd_err_code;
@@ -1595,6 +1627,11 @@ static int execute_command(void* handle, int argc, char* argv[])
     return CMD_UNKNOWN;
 }
 
+static void bt_tool_uninit_cb(void* data)
+{
+    bt_tool_uninit(g_bttool_ins);
+}
+
 static void on_adapter_state_changed_cb(void* cookie, bt_adapter_state_t state)
 {
     PRINT("Context:%p, Adapter state changed: %d", cookie, state);
@@ -1616,7 +1653,10 @@ static void on_adapter_state_changed_cb(void* cookie, bt_adapter_state_t state)
         PRINT("Adapter Name: %s, Cap: %d, Class: 0x%08" PRIX32 ", Mode:%d", name, cap, class, mode);
     } else if (state == BT_ADAPTER_STATE_TURNING_OFF) {
         /* code */
-        bt_tool_uninit(g_bttool_ins);
+        if (is_loop_valid_and_not_closed()) {
+            uv_loop_t* loop = get_bttool_loop();
+            do_in_thread_loop(loop, bt_tool_uninit_cb, NULL);
+        }
     } else if (state == BT_ADAPTER_STATE_OFF) {
         /* do something */
     }
@@ -1819,6 +1859,7 @@ static void bttool_ins_uninit(bttool_t* bttool)
     bluetooth_delete_instance(g_bttool_ins);
     g_bttool_ins = NULL;
     adapter_callback = NULL;
+    set_bttool_loop(NULL);
 }
 
 #ifdef CONFIG_LIBUV_EXTENSION
@@ -1906,7 +1947,7 @@ static void bttool_thread(void* data)
        before the asynchronous instance is created.
     */
     uv_loop_init(&bttool->loop);
-
+    set_bttool_loop(&bttool->loop);
     /* initialize synchronous or asynchronous instance.
        and register callbacks.
     */
